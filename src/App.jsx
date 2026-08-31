@@ -4,7 +4,7 @@ import {
   ChevronRight, ChevronLeft, ChevronDown, Flame, Sun, Moon, Settings as SettingsIcon,
   Star, Clock, Play, Trophy, Scale, Edit2, Trash2, Download, ArrowLeft, Timer,
   BarChart3, Filter, Calendar, Pause, RotateCcw, Sparkles, Target, Zap, ChevronUp,
-  Copy, AlertCircle, LayoutGrid, ListFilter, Camera, Upload, RefreshCw
+  Copy, AlertCircle, LayoutGrid, ListFilter, Camera, Upload, RefreshCw, Barcode
 } from "lucide-react";
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar as RBar, XAxis, YAxis,
@@ -945,6 +945,58 @@ function mapOFFProduct(p) {
   };
 }
 
+// Barcode scanning (free, no API key): decode a product barcode with the
+// device camera client-side, then look the code up in Open Food Facts. This
+// is more accurate than any photo estimate for packaged goods -- it reads the
+// actual label. The result is shaped into the SAME object the photo/AI flow
+// produces, so both feed the one editable review screen in PhotoLogSheet.
+async function lookupBarcode(code) {
+  const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(code)}.json?fields=code,product_name,brands,serving_size,nutriments`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("bad response");
+  const data = await res.json();
+  if (!data || data.status === 0 || !data.product) return null;
+  return offProductToScanResult(data.product);
+}
+
+function offProductToScanResult(p) {
+  const n = p.nutriments || {};
+  const num = (v) => (typeof v === "number" && !isNaN(v) ? v : null);
+  const kcalServing = num(n["energy-kcal_serving"]);
+  const kcal100 = num(n["energy-kcal_100g"]) != null
+    ? num(n["energy-kcal_100g"])
+    : (num(n["energy_100g"]) != null ? n["energy_100g"] / 4.184 : null);
+  // Prefer per-serving values (closer to what you actually eat); else per 100g.
+  let calories, protein, carbs, fat, servingDescription;
+  if (kcalServing != null) {
+    calories = kcalServing;
+    protein = num(n["proteins_serving"]) || 0;
+    carbs = num(n["carbohydrates_serving"]) || 0;
+    fat = num(n["fat_serving"]) || 0;
+    servingDescription = p.serving_size ? `1 serving (${p.serving_size})` : "1 serving";
+  } else {
+    if (kcal100 == null) return null;
+    calories = kcal100;
+    protein = num(n["proteins_100g"]) || 0;
+    carbs = num(n["carbohydrates_100g"]) || 0;
+    fat = num(n["fat_100g"]) || 0;
+    servingDescription = "per 100 g — adjust to your portion below";
+  }
+  const name = (p.product_name || "").trim();
+  if (!name) return null;
+  const brand = p.brands ? p.brands.split(",")[0].trim() : "";
+  return {
+    foodName: brand ? `${name} · ${brand}` : name,
+    servingDescription,
+    calories: Math.round(calories),
+    protein: round1(protein),
+    carbs: round1(carbs),
+    fat: round1(fat),
+    confidence: "high",
+    notes: "Read from the product label via Open Food Facts — adjust the amount if you ate more or less than one serving.",
+  };
+}
+
 // USDA's /foods/search endpoint returns nutrients as a flat array keyed by
 // nutrientNumber (a stable USDA code), not by name -- name is used only as a fallback.
 function findUSDANutrient(foodNutrients, number, nameSubstr) {
@@ -1240,17 +1292,79 @@ function resizeImageToBase64(file, maxDim = 1024, quality = 0.82) {
   });
 }
 
-// Photo -> AI nutrition estimate -> editable review -> log. Calls a backend
-// serverless function (api/analyze-food.js) rather than any AI API directly,
-// so no API key of any kind is ever present in this browser-side code.
+// Two free ways to log food here, feeding one shared editable review screen:
+//   1. Barcode scan -> Open Food Facts lookup (no API key, reads the real
+//      label; most accurate for packaged goods). Runs fully client-side.
+//   2. Photo -> AI nutrition estimate via a backend serverless function
+//      (api/analyze-food.js, Gemini free tier). No API key ever touches this
+//      browser-side code -- it lives server-side only.
 function PhotoLogSheet({ onClose, onLog }) {
-  const [stage, setStage] = useState("capture"); // capture | analyzing | result | error
+  const [stage, setStage] = useState("capture"); // capture | scanning | looking-up | analyzing | result | error
   const [imageDataUrl, setImageDataUrl] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
   const [result, setResult] = useState(null);
   const [meal, setMeal] = useState("breakfast");
   const cameraInputRef = useRef(null);
   const libraryInputRef = useRef(null);
+  const videoRef = useRef(null);
+  const barcodeControlsRef = useRef(null);
+
+  const resetToCapture = () => {
+    try { barcodeControlsRef.current && barcodeControlsRef.current.stop(); } catch (e) {}
+    barcodeControlsRef.current = null;
+    setImageDataUrl(null); setResult(null); setErrorMsg(""); setStage("capture");
+  };
+
+  // Start the live camera barcode reader once the <video> for the "scanning"
+  // stage is mounted. ZXing is dynamically imported so it only downloads when
+  // barcode scanning is actually used, keeping the initial bundle small.
+  useEffect(() => {
+    if (stage !== "scanning") return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { BrowserMultiFormatReader } = await import("@zxing/browser");
+        const reader = new BrowserMultiFormatReader();
+        // Prefer the rear ("environment") camera on phones for barcode scanning.
+        const constraints = { video: { facingMode: { ideal: "environment" } } };
+        const controls = await reader.decodeFromConstraints(constraints, videoRef.current, (res, err, ctrl) => {
+          if (cancelled || !res) return;
+          const text = typeof res.getText === "function" ? res.getText() : res.text;
+          if (text) { ctrl.stop(); handleBarcode(text); }
+        });
+        if (cancelled) { controls.stop(); return; }
+        barcodeControlsRef.current = controls;
+      } catch (e) {
+        if (!cancelled) {
+          setErrorMsg("Couldn't start the camera for barcode scanning. Allow camera access (scanning needs HTTPS), or use photo scanning instead.");
+          setStage("error");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      try { barcodeControlsRef.current && barcodeControlsRef.current.stop(); } catch (e) {}
+      barcodeControlsRef.current = null;
+    };
+  }, [stage]);
+
+  const handleBarcode = async (code) => {
+    setErrorMsg("");
+    setStage("looking-up");
+    try {
+      const r = await lookupBarcode(code);
+      if (!r) {
+        setErrorMsg(`No product found for barcode ${code} in Open Food Facts. Try snapping a photo instead, or add it as a custom food.`);
+        setStage("error");
+        return;
+      }
+      setResult(r);
+      setStage("result");
+    } catch (e) {
+      setErrorMsg("Couldn't reach Open Food Facts to look up that barcode. Check your connection and try again.");
+      setStage("error");
+    }
+  };
 
   const analyze = async (file) => {
     setErrorMsg("");
@@ -1282,7 +1396,7 @@ function PhotoLogSheet({ onClose, onLog }) {
       });
       setStage("result");
     } catch (e) {
-      setErrorMsg("Couldn't reach the photo analysis backend. If you haven't set this up yet, see the README (it needs ANTHROPIC_API_KEY on the server and won't work with plain `npm run dev`).");
+      setErrorMsg("Couldn't reach the photo analysis backend. If you haven't set this up yet, see the README (it needs a free GEMINI_API_KEY on the server and won't work with plain `npm run dev`). Barcode scanning works without any of that.");
       setStage("error");
     }
   };
@@ -1296,20 +1410,45 @@ function PhotoLogSheet({ onClose, onLog }) {
           <div className="w-16 h-16 rounded-2xl flex items-center justify-center mb-4" style={{ background: "var(--card-alt)", color: "var(--primary)" }}>
             <Camera size={28} />
           </div>
-          <p className="rw-display font-semibold text-base mb-1">Snap or upload a photo</p>
-          <p className="text-sm mb-6" style={{ color: "var(--text-secondary)" }}>AI will estimate the food, calories, and macros. You'll be able to adjust everything before logging it.</p>
+          <p className="rw-display font-semibold text-base mb-1">Scan a barcode or a photo</p>
+          <p className="text-sm mb-6" style={{ color: "var(--text-secondary)" }}>Scan a product barcode for exact label data (free, most accurate), or snap a photo and let AI estimate the food, calories, and macros. You can adjust everything before logging.</p>
+          <button onClick={() => { setErrorMsg(""); setStage("scanning"); }} className="rw-btn-primary w-full py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-1.5 mb-3">
+            <Barcode size={16} />Scan barcode
+          </button>
           <div className="flex gap-3 w-full">
-            <button onClick={() => cameraInputRef.current && cameraInputRef.current.click()} className="rw-btn-primary flex-1 py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-1.5">
-              <Camera size={16} />Take photo
+            <button onClick={() => cameraInputRef.current && cameraInputRef.current.click()} className="flex-1 py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-1.5" style={{ background: "var(--card-alt)", border: "1px solid var(--border)" }}>
+              <Camera size={16} />Photo
             </button>
             <button onClick={() => libraryInputRef.current && libraryInputRef.current.click()} className="flex-1 py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-1.5" style={{ background: "var(--card-alt)", border: "1px solid var(--border)" }}>
               <Upload size={16} />Upload
             </button>
           </div>
+          <p className="rw-fs-11 mt-3" style={{ color: "var(--text-tertiary)" }}>Barcode scanning works with no setup. Photo scanning needs a free Gemini key on the server — see the README.</p>
           <input ref={cameraInputRef} type="file" accept="image/*" capture="environment" className="hidden"
             onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) analyze(f); e.target.value = ""; }} />
           <input ref={libraryInputRef} type="file" accept="image/*" className="hidden"
             onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) analyze(f); e.target.value = ""; }} />
+        </div>
+      )}
+
+      {stage === "scanning" && (
+        <div className="flex flex-col items-center text-center py-2">
+          <div className="w-full rounded-2xl overflow-hidden mb-4" style={{ background: "#000", aspectRatio: "3 / 4", maxHeight: 320, position: "relative" }}>
+            <video ref={videoRef} playsInline muted style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            <div style={{ position: "absolute", left: "10%", right: "10%", top: "50%", height: 2, background: "var(--primary)", boxShadow: "0 0 0 9999px rgba(0,0,0,0.15)" }} />
+          </div>
+          <p className="text-sm font-medium mb-1">Point at a product barcode</p>
+          <p className="rw-fs-11 mb-4" style={{ color: "var(--text-tertiary)" }}>Hold steady — it scans automatically.</p>
+          <button onClick={resetToCapture} className="px-5 py-2.5 rounded-full text-sm font-semibold flex items-center gap-1.5" style={{ background: "var(--card-alt)", border: "1px solid var(--border)" }}>
+            <ChevronLeft size={14} />Back
+          </button>
+        </div>
+      )}
+
+      {stage === "looking-up" && (
+        <div className="flex flex-col items-center text-center py-10">
+          <div className="w-8 h-8 rounded-full animate-pulse mb-3" style={{ background: "linear-gradient(135deg, var(--primary), var(--secondary))" }} />
+          <p className="text-sm font-medium">Looking up that barcode…</p>
         </div>
       )}
 
@@ -1327,7 +1466,7 @@ function PhotoLogSheet({ onClose, onLog }) {
             <AlertCircle size={24} />
           </div>
           <p className="text-sm mb-5" style={{ color: "var(--text-secondary)" }}>{errorMsg}</p>
-          <button onClick={() => { setStage("capture"); setImageDataUrl(null); }} className="rw-btn-primary px-5 py-2.5 rounded-full text-sm font-semibold flex items-center gap-1.5">
+          <button onClick={resetToCapture} className="rw-btn-primary px-5 py-2.5 rounded-full text-sm font-semibold flex items-center gap-1.5">
             <RefreshCw size={14} />Try again
           </button>
         </div>
@@ -1362,12 +1501,12 @@ function PhotoLogSheet({ onClose, onLog }) {
             </div>
           </Field>
           <div className="flex gap-3 mt-2">
-            <button onClick={() => { setStage("capture"); setImageDataUrl(null); setResult(null); }} className="px-5 py-3 rounded-full text-sm font-semibold flex items-center gap-1.5" style={{ background: "var(--card-alt)", border: "1px solid var(--border)" }}>
-              <RefreshCw size={14} />Retake
+            <button onClick={resetToCapture} className="px-5 py-3 rounded-full text-sm font-semibold flex items-center gap-1.5" style={{ background: "var(--card-alt)", border: "1px solid var(--border)" }}>
+              <RefreshCw size={14} />Scan again
             </button>
             <button onClick={() => onLog({ meal, result })} className="rw-btn-primary flex-1 py-3 rounded-full text-sm font-semibold">Log {result.foodName}</button>
           </div>
-          <p className="rw-fs-11 mt-3 text-center" style={{ color: "var(--text-tertiary)" }}>AI estimate — always spot-check against what you actually ate.</p>
+          <p className="rw-fs-11 mt-3 text-center" style={{ color: "var(--text-tertiary)" }}>Estimate — always spot-check against what you actually ate.</p>
         </div>
       )}
     </Sheet>

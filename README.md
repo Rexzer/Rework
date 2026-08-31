@@ -21,14 +21,19 @@ that ran inside the claude.ai chat artifact. The two differences that matter:
   up in your search once deployed**, that's the most likely cause, and the fix
   is a small serverless proxy function (say the word and I'll write one) — not
   a caching or code bug beyond that.
-- **Photo food scanning** ("Scan Food" on Home, or "Scan" in the Nutrition
-  tab): take or upload a photo, and a backend function (`api/analyze-food.js`)
-  sends it to Claude's vision API to estimate the food, calories, and macros,
-  which you can edit before logging. This needs your own Anthropic API key —
-  see section 4 below. **Unlike the USDA key, this one must never be exposed
-  to the browser** — it's billed per request, so an exposed key is a real
-  financial risk, not just an inconvenience. That's why it lives in a backend
-  function instead of a `VITE_`-prefixed variable.
+- **Food scanning** ("Scan Food" on Home, or "Scan" in the Nutrition tab) has
+  two free modes:
+  - **Barcode scan** (no API key, no setup): point your camera at a product
+    barcode and Rework decodes it in the browser, then looks it up in Open
+    Food Facts for the exact label nutrition. This is the most accurate option
+    for packaged foods and works entirely client-side.
+  - **Photo estimate**: take or upload a photo, and a backend function
+    (`api/analyze-food.js`) sends it to **Google Gemini** to estimate the
+    food, calories, and macros, which you can edit before logging. Gemini has
+    a genuinely **free tier** (no credit card needed), so this costs nothing
+    for personal use — see section 4. The Gemini key must never be exposed to
+    the browser, so it lives in the backend function (server-side env var),
+    not a `VITE_`-prefixed variable.
 
 ## 1. Local setup
 
@@ -88,14 +93,16 @@ do this natively.
    then redeploy (env vars from your local `.env` do NOT travel with the
    deployment automatically):
    - `VITE_USDA_API_KEY` — your USDA key (safe to be client-exposed, it's free/rate-limited)
-   - `ANTHROPIC_API_KEY` — your Anthropic key, for photo scanning (**do NOT
-     prefix this with VITE_** — it must stay server-side only)
+   - `GEMINI_API_KEY` — your free Google Gemini key, for photo scanning (**do
+     NOT prefix this with VITE_** — it must stay server-side only). Not needed
+     for barcode scanning.
 
 ### Netlify
 1. Push to GitHub, same as above
 2. https://app.netlify.com → "Add new site" → import the repo
 3. Build command: `npm run build` · Publish directory: `dist`
-4. Add the same two environment variables under Site settings → Environment
+4. Add the same two environment variables (`VITE_USDA_API_KEY`,
+   `GEMINI_API_KEY`) under Site settings → Environment
    variables. Note: Netlify's serverless functions live in a different folder
    convention (`netlify/functions/`) than Vercel's (`api/`) — if you deploy to
    Netlify instead of Vercel, tell me and I'll adapt `api/analyze-food.js`
@@ -103,36 +110,47 @@ do this natively.
 
 ### No GitHub? Drag-and-drop
 Run `npm run build` locally, then drag the resulting `dist/` folder onto
-https://app.netlify.com/drop. Works for the core app, but **photo scanning
-won't work this way** — serverless functions need a real project connection,
-not just a static folder drop.
+https://app.netlify.com/drop. Works for the core app **including barcode
+scanning** (it's fully client-side), but **photo scanning won't work this
+way** — serverless functions need a real project connection, not just a
+static folder drop.
 
-## 4. Setting up photo food scanning
+## 4. Setting up food scanning
 
-1. Get an Anthropic API key at https://console.anthropic.com (this is a
-   **billed** API, unlike the free USDA/Open Food Facts integrations — check
-   current pricing at https://www.anthropic.com/pricing before relying on this
-   heavily; a single food photo is a small request, but it's not free)
-2. **Do not** put this key in your local `.env` file / do not prefix it with
-   `VITE_` — that would bundle it into the public JavaScript anyone can read.
-   It only goes into your hosting platform's server-side environment
-   variables (see step 4 in each deploy section above)
+**Barcode scanning needs zero setup.** It runs entirely in the browser and
+looks products up in the free Open Food Facts database. It only requires the
+site to be served over HTTPS (any real deployment is) so the browser will
+grant camera access — that's it. If a scanned product isn't in Open Food
+Facts, fall back to a photo estimate or a custom food.
+
+**Photo scanning** (optional) uses Google Gemini's free tier:
+
+1. Get a **free** Gemini API key at https://aistudio.google.com/apikey
+   (no credit card required). The free tier is rate-limited per project but
+   costs nothing — plenty for personal food logging.
+2. **Do not** put this key in your local `.env` for `npm run dev`, and do not
+   prefix it with `VITE_` — that would bundle it into the public JavaScript
+   anyone can read. It only goes into your hosting platform's server-side
+   environment variables as `GEMINI_API_KEY` (see step 4 in each deploy
+   section above).
 3. **Testing locally**: plain `npm run dev` does NOT run the `/api` function
    — that's Vercel-specific serverless infrastructure. To test photo scanning
    before deploying, either (a) deploy to Vercel and test there, or (b)
    install the Vercel CLI and run `vercel dev` instead of `npm run dev`,
-   which emulates the serverless functions locally
-4. Once deployed with `ANTHROPIC_API_KEY` set, tap "Scan Food" (Home) or
-   "Scan" (Nutrition tab) to try it
+   which emulates the serverless functions locally (only then does putting
+   `GEMINI_API_KEY` in a local `.env` make sense).
+4. Once deployed with `GEMINI_API_KEY` set, tap "Scan Food" (Home) or
+   "Scan" (Nutrition tab) → "Photo" to try it.
 
 ## Data & privacy
 
 - All data (profile, food log, routines, workout history, weigh-ins) is
   stored in your browser's `localStorage` — nothing leaves your device except
-  food search requests to USDA/Open Food Facts (only your search text) and,
-  if you use it, photos sent to Anthropic's API for analysis via your own
-  backend function. Photos aren't stored anywhere by this app — they're sent,
-  analyzed, and discarded per request.
+  food search requests to USDA/Open Food Facts (only your search text),
+  barcode lookups to Open Food Facts (only the scanned product code), and,
+  if you use photo scanning, photos sent to Google Gemini for analysis via
+  your own backend function. Photos aren't stored anywhere by this app —
+  they're sent, analyzed, and discarded per request.
 - Different browser or device = different, separate data. There's no account
   system or sync — this app doesn't have a backend beyond the one small
   function for photo analysis.
