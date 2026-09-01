@@ -11,16 +11,15 @@ that ran inside the claude.ai chat artifact. The two differences that matter:
   `src/lib/storage.js`) instead of claude.ai's sandbox-only storage API. Once
   deployed, your data lives entirely in your browser, on your device — nobody
   else can see it, and it's never sent to any server, because there is no server.
-- **Live food search**: USDA FoodData Central and Open Food Facts are called
-  directly from the browser. This *should* work here (unlike inside the
-  claude.ai artifact, which blocks that entirely) — but I want to be upfront
-  that I could not verify this myself before handing it to you: I don't have a
-  way to run a live build or open a real browser from where I work, and I
-  specifically was not able to confirm USDA's API sends the CORS header
-  browsers require for this to work cross-origin. **If USDA results don't show
-  up in your search once deployed**, that's the most likely cause, and the fix
-  is a small serverless proxy function (say the word and I'll write one) — not
-  a caching or code bug beyond that.
+- **Live food search**: Open Food Facts is called directly from the browser,
+  and USDA FoodData Central now goes through a small serverless proxy
+  (`api/usda-search.js`). The proxy exists because USDA's API doesn't send the
+  CORS header a direct browser fetch requires, so calling it straight from the
+  browser fails cross-origin — the proxy forwards the request server-side and
+  fixes that. Both sources are free. (If you deploy as a static-only site with
+  no serverless functions, the app falls back to a direct USDA call using a
+  client-exposed `VITE_USDA_API_KEY`, which may still be CORS-blocked — the
+  proxy is the reliable path.)
 - **Food scanning** ("Scan Food" on Home, or "Scan" in the Nutrition tab) has
   two free modes:
   - **Barcode scan** (no API key, no setup): point your camera at a product
@@ -50,16 +49,15 @@ VITE_USDA_API_KEY=your_key_here
 ```
 
 You can skip this — the app works fully without it, USDA results are just
-skipped (Open Food Facts and your local food library still work).
+skipped (Open Food Facts and your local food library still work). Note that
+in a real deployment USDA search runs through the `api/usda-search.js` proxy
+(to avoid a CORS block), which reads `USDA_API_KEY` or `VITE_USDA_API_KEY`
+from your host's environment — see section 3.
 
-**A note on the very first `npm install`:** I was not able to run this myself
-before giving it to you (my own sandbox's network access to the npm registry
-turned out to be blocked, despite documentation suggesting otherwise). This
-project is a standard, common combination of packages (React 18 + Vite +
-Tailwind + recharts + lucide-react) so I'm fairly confident it'll install
-cleanly, but if `npm install` or `npm run dev` throws an error, paste it back
-to me and I'll fix it immediately — I just want you to know this step hasn't
-been tested end-to-end yet.
+**A note on `npm install`:** this is a standard combination of packages
+(React 18 + Vite + Tailwind + recharts + lucide-react, plus `@zxing/browser`
+for barcode scanning). If `npm install` or `npm run dev` throws an error,
+paste it back and I'll fix it.
 
 ```bash
 npm run dev
@@ -81,9 +79,9 @@ npm run preview
 
 ## 3. Deploy it
 
-Any static host works for the app itself, but **photo scanning needs a host
-that runs serverless functions** (the `api/` folder) — Vercel and Netlify both
-do this natively.
+Any static host works for the core app and barcode scanning, but **photo
+scanning and reliable USDA search need a host that runs serverless functions**
+(the `api/` folder) — Vercel and Netlify both do this natively.
 
 ### Vercel (recommended, simplest)
 1. Push this folder to a GitHub repo (private is fine)
@@ -92,7 +90,9 @@ do this natively.
 4. Add environment variables under Project Settings → Environment Variables,
    then redeploy (env vars from your local `.env` do NOT travel with the
    deployment automatically):
-   - `VITE_USDA_API_KEY` — your USDA key (safe to be client-exposed, it's free/rate-limited)
+   - `USDA_API_KEY` — your free USDA key. Preferred: this name keeps it
+     server-side (used by the `api/usda-search.js` proxy, which fixes the CORS
+     issue). `VITE_USDA_API_KEY` also works but is client-exposed.
    - `GEMINI_API_KEY` — your free Google Gemini key, for photo scanning (**do
      NOT prefix this with VITE_** — it must stay server-side only). Not needed
      for barcode scanning.

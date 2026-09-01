@@ -106,13 +106,17 @@ const THEME_CSS = `
 
 const GOOGLE_FONTS = `@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');`;
 
-// USDA FoodData Central — get a free personal API key at
-// https://fdc.nal.usda.gov/api-key-signup.html, then put it in a local
-// ".env" file (copy .env.example) as VITE_USDA_API_KEY=your_key_here.
-// Vite only exposes env vars prefixed VITE_ to client code, and only at
-// build/dev time -- it is sent nowhere except directly from the visitor's
-// own browser to api.nal.usda.gov. If left blank, USDA results are simply
-// skipped; your local library and Open Food Facts still work fully.
+// USDA FoodData Central — free personal API key at
+// https://fdc.nal.usda.gov/api-key-signup.html.
+//
+// Preferred setup: set USDA_API_KEY (server-side) so searches go through the
+// /api/usda-search proxy, which avoids the browser CORS problem (USDA doesn't
+// send the CORS header a direct browser fetch needs). See searchUSDA() below.
+//
+// This client-exposed VITE_USDA_API_KEY is only a fallback for static-only
+// deploys with no serverless functions -- it lets the browser try USDA
+// directly (which may be CORS-blocked). If neither is set, USDA results are
+// simply skipped; your local library and Open Food Facts still work fully.
 const USDA_API_KEY = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_USDA_API_KEY) || "";
 const USDA_DATA_TYPES = "Foundation,SR Legacy,Survey (FNDDS)";
 // Live search against USDA / Open Food Facts. This only actually does
@@ -1026,6 +1030,39 @@ function mapUSDAFood(item) {
   };
 }
 
+// Search USDA, preferring the serverless proxy (/api/usda-search) which fixes
+// the browser CORS problem. Falls back to a direct browser call only if the
+// proxy isn't available (e.g. a static-only deploy) AND a client-exposed
+// VITE_USDA_API_KEY is present. Returns { foods } on success, { noKey: true }
+// when no key is configured anywhere, or throws on a genuine lookup failure.
+async function searchUSDA(query) {
+  // 1) Preferred path: same-origin serverless proxy (server-side key, no CORS).
+  try {
+    const res = await fetch(`/api/usda-search?query=${encodeURIComponent(query)}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && !data.error) return { foods: data.foods || [] };
+      // data.error === "no-key": proxy is live but no key set server-side.
+      // Fall through to the client-key fallback below before giving up.
+    }
+    // A non-OK status (e.g. 404 on a static host with no functions) also
+    // falls through to the direct attempt.
+  } catch (e) {
+    // Proxy unreachable — fall through to the direct attempt.
+  }
+
+  // 2) Fallback: direct browser call if a client-exposed key exists.
+  if (USDA_API_KEY) {
+    const url = `https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${USDA_API_KEY}&query=${encodeURIComponent(query)}&pageSize=10&dataType=${encodeURIComponent(USDA_DATA_TYPES)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("bad response");
+    const data = await res.json();
+    return { foods: data.foods || [] };
+  }
+
+  return { noKey: true };
+}
+
 function FoodRow({ f, onPick }) {
   const badge = f.custom ? { label: "Custom", color: "var(--secondary)" }
     : f.reliability === "usda" ? { label: "USDA", color: "var(--primary)" }
@@ -1108,14 +1145,11 @@ function FoodSearchSheet({ onClose, foods, customFoods, onPick, favorites, onCre
         }
       })();
       (async () => {
-        if (!USDA_API_KEY) { if (!cancelled) { setUsdaLoading(false); setUsdaNoKey(true); } return; }
         try {
-          const url = `https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${USDA_API_KEY}&query=${encodeURIComponent(query)}&pageSize=10&dataType=${encodeURIComponent(USDA_DATA_TYPES)}`;
-          const res = await fetch(url);
-          if (!res.ok) throw new Error("bad response");
-          const data = await res.json();
+          const out = await searchUSDA(query);
           if (cancelled) return;
-          setUsdaResults((data.foods || []).map(mapUSDAFood).filter(Boolean).slice(0, 10));
+          if (out.noKey) { setUsdaNoKey(true); setUsdaResults([]); }
+          else setUsdaResults((out.foods || []).map(mapUSDAFood).filter(Boolean).slice(0, 10));
         } catch (e) {
           if (!cancelled) { setUsdaError(true); setUsdaResults([]); }
         } finally {
@@ -1155,7 +1189,7 @@ function FoodSearchSheet({ onClose, foods, customFoods, onPick, favorites, onCre
             <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: "var(--text-tertiary)" }}>From USDA FoodData Central</p>
             {usdaLoading && <span className="rw-fs-11" style={{ color: "var(--text-tertiary)" }}>Searching…</span>}
           </div>
-          {usdaNoKey && <p className="text-xs mb-1" style={{ color: "var(--text-tertiary)" }}>Add a free USDA API key to your .env file to enable this — see README.</p>}
+          {usdaNoKey && <p className="text-xs mb-1" style={{ color: "var(--text-tertiary)" }}>Add a free USDA API key (USDA_API_KEY) in your host's environment variables to enable this — see README.</p>}
           {usdaError && <p className="text-xs mb-1" style={{ color: "var(--text-tertiary)" }}>USDA lookup isn't reachable right now — local results above still work fine.</p>}
           {!usdaLoading && !usdaError && !usdaNoKey && usdaResults.length === 0 && (
             <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>No USDA matches for this search.</p>
